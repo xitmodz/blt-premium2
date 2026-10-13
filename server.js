@@ -16,12 +16,15 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_USER = process.env.ADMIN_USER;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
-const QR_DIR = "/tmp/rudo-bot";
 const PREFIX = "/";
 
 let sock;
+let authState;
 let qrDataUrl = null;
+let pairCode = null;
+let pairMessage = "";
 let connectionStatus = "Iniciando";
+let isRegistered = false;
 let starting = false;
 let reconnectTimer;
 
@@ -30,7 +33,7 @@ if (!ADMIN_USER || !ADMIN_PASSWORD) {
   process.exit(1);
 }
 
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: false, limit: "10kb" }));
 
 function authorized(req, res, next) {
   const header = req.headers.authorization || "";
@@ -64,39 +67,129 @@ app.get("/", (req, res) => {
   res.type("text").send("Rudo-Bot está activo.");
 });
 
-app.get("/panel", authorized, (req, res) => {
+function renderPanel() {
   const qrSection = qrDataUrl
-    ? `<h2>Escanea este QR con tu WhatsApp</h2>
-       <img width="280" alt="QR privado de vinculación" src="${qrDataUrl}">`
-    : "<p>No hay QR disponible. Estado: " + connectionStatus + "</p>";
+    ? `<h3>Vincular escaneando QR</h3>
+       <img style="max-width:100%;width:280px"
+       alt="QR privado de vinculación" src="${qrDataUrl}">`
+    : "<p>No hay QR disponible en este momento.</p>";
 
-  res.send(`
+  const codeSection = pairCode
+    ? `<h3>Código de vinculación</h3>
+       <p style="font-size:28px;font-weight:bold;letter-spacing:4px">
+       ${pairCode}</p>
+       <p>Introduce este código en WhatsApp en tu teléfono principal.</p>`
+    : "";
+
+  return `
     <!doctype html>
     <html lang="es">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Rudo-Bot</title>
-    <body style="font-family:Arial;max-width:600px;margin:40px auto;padding:16px">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta http-equiv="refresh" content="10">
+      <title>Rudo-Bot Premium</title>
+    </head>
+    <body style="font-family:Arial;max-width:600px;margin:30px auto;padding:16px">
       <h1>🔥 Rudo-Bot Premium</h1>
-      <p>Estado: ${connectionStatus}</p>
+      <p><b>Estado:</b> ${connectionStatus}</p>
+      ${pairMessage ? `<p>${pairMessage}</p>` : ""}
       ${qrSection}
-      <p>Abre WhatsApp en tu teléfono principal → Dispositivos vinculados
-      → Vincular un dispositivo y escanea el QR.</p>
-      <p>Por seguridad, no compartas este QR ni una captura del panel.</p>
+      ${codeSection}
+
+      <hr>
+      <h2>Vincular con número de teléfono</h2>
+      <p>Escribe el número completo con el prefijo internacional.</p>
+      <p>Ejemplos: +57 300 123 4567 o +34 600 123 456</p>
+
+      <form method="post" action="/pair">
+        <label for="phone">Número internacional</label><br>
+        <input
+          id="phone"
+          name="phone"
+          type="tel"
+          autocomplete="tel"
+          placeholder="+57 300 123 4567"
+          required
+          maxlength="25"
+          style="box-sizing:border-box;width:100%;padding:12px;margin:10px 0"
+        >
+        <button type="submit" style="padding:12px;width:100%">
+          Generar código de vinculación
+        </button>
+      </form>
+
+      <hr>
+      <p>En WhatsApp: Dispositivos vinculados → Vincular un dispositivo.
+      Para emparejar por número, busca la opción de vincular con número de teléfono
+      en WhatsApp si está disponible en tu versión.</p>
+
+      <p><b>No compartas el QR ni el código de vinculación.</b></p>
+
       <form method="post" action="/logout">
         <button type="submit">Desconectar bot</button>
       </form>
     </body>
     </html>
-  `);
+  `;
+}
+
+app.get("/panel", authorized, (req, res) => {
+  res.send(renderPanel());
+});
+
+app.post("/pair", authorized, async (req, res) => {
+  const number = String(req.body.phone || "").replace(/\D/g, "");
+
+  if (number.length < 7 || number.length > 15) {
+    pairMessage = "Revisa el número e incluye el prefijo internacional.";
+    return res.status(400).send(renderPanel());
+  }
+
+  if (!sock || !authState) {
+    pairMessage = "El bot todavía está iniciando. Espera unos segundos y vuelve a intentarlo.";
+    return res.status(503).send(renderPanel());
+  }
+
+  if (isRegistered || authState.creds.registered) {
+    pairMessage =
+      "Ya hay una sesión registrada. No solicites otro código para esta sesión.";
+    return res.status(409).send(renderPanel());
+  }
+
+  try {
+    pairMessage = "Solicitando código de vinculación...";
+    pairCode = null;
+
+    const code = await sock.requestPairingCode(number);
+
+    pairCode = code;
+    pairMessage =
+      "Código generado. Úsalo pronto; puede caducar. No lo compartas.";
+
+    console.log("Se generó un código de vinculación.");
+    return res.redirect(303, "/panel");
+  } catch (error) {
+    console.error("Error al solicitar código de vinculación:", error);
+    pairCode = null;
+    pairMessage =
+      "No se pudo generar el código. Revisa Logs en Render e inténtalo otra vez.";
+    return res.status(500).send(renderPanel());
+  }
 });
 
 app.post("/logout", authorized, async (req, res) => {
   try {
     if (sock) await sock.logout();
+
     connectionStatus = "Desconectado";
     qrDataUrl = null;
-    res.send("Bot desconectado. Puedes cerrar esta página.");
-  } catch {
+    pairCode = null;
+    pairMessage = "La sesión se desconectó.";
+
+    res.redirect(303, "/panel");
+  } catch (error) {
+    console.error("Error al desconectar:", error);
     res.status(500).send("No se pudo desconectar.");
   }
 });
@@ -107,41 +200,58 @@ async function startBot() {
 
   try {
     await fs.mkdir(AUTH_DIR, { recursive: true });
-    await fs.mkdir(QR_DIR, { recursive: true });
 
     const { state, saveCreds } =
       await useMultiFileAuthState(AUTH_DIR);
+
+    authState = state;
+    isRegistered = Boolean(state.creds.registered);
 
     let version;
     try {
       const result = await fetchLatestBaileysVersion();
       version = result.version;
-    } catch {
-      version = undefined;
+    } catch (error) {
+      console.error("No se pudo consultar la versión de WhatsApp:", error.message);
     }
 
     sock = makeWASocket({
       ...(version ? { version } : {}),
       auth: state,
-      logger: pino({ level: "silent" }),
+      logger: pino({ level: "warn" }),
       printQRInTerminal: false,
       browser: ["Rudo-Bot", "Chrome", "1.0.0"],
       markOnlineOnConnect: false
     });
 
-    sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", async () => {
+      try {
+        await saveCreds();
+        isRegistered = Boolean(authState?.creds?.registered);
+      } catch (error) {
+        console.error("Error guardando la sesión:", error.message);
+      }
+    });
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
-        qrDataUrl = await QRCode.toDataURL(qr);
-        connectionStatus = "Esperando escaneo del QR";
+        try {
+          qrDataUrl = await QRCode.toDataURL(qr);
+          connectionStatus = "Esperando escaneo del QR";
+          console.log("Se generó un QR de vinculación.");
+        } catch (error) {
+          console.error("Error generando QR:", error.message);
+        }
       }
 
       if (connection === "open") {
         qrDataUrl = null;
+        pairCode = null;
+        pairMessage = "";
         connectionStatus = "Conectado";
+        isRegistered = true;
         console.log("Rudo-Bot conectado.");
       }
 
@@ -151,8 +261,11 @@ async function startBot() {
         const statusCode =
           lastDisconnect?.error?.output?.statusCode;
 
+        console.error("Conexión cerrada. Código:", statusCode ?? "desconocido");
+
         if (statusCode === DisconnectReason.loggedOut) {
-          connectionStatus = "Sesión cerrada; elimina la sesión y vuelve a vincular.";
+          connectionStatus = "Sesión cerrada; requiere nueva vinculación.";
+          pairCode = null;
           console.error(connectionStatus);
           return;
         }
@@ -232,3 +345,4 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Rudo-Bot escuchando en el puerto ${PORT}`);
   startBot();
 });
+            
