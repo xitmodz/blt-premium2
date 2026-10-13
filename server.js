@@ -147,7 +147,8 @@ app.post("/pair", authorized, async (req, res) => {
   }
 
   if (!sock || !authState) {
-    pairMessage = "El bot todavía está iniciando. Espera unos segundos y vuelve a intentarlo.";
+    pairMessage =
+      "El bot todavía está iniciando. Espera unos segundos y vuelve a intentarlo.";
     return res.status(503).send(renderPanel());
   }
 
@@ -208,11 +209,15 @@ async function startBot() {
     isRegistered = Boolean(state.creds.registered);
 
     let version;
+
     try {
       const result = await fetchLatestBaileysVersion();
       version = result.version;
     } catch (error) {
-      console.error("No se pudo consultar la versión de WhatsApp:", error.message);
+      console.error(
+        "No se pudo consultar la versión de WhatsApp:",
+        error.message
+      );
     }
 
     sock = makeWASocket({
@@ -220,7 +225,6 @@ async function startBot() {
       auth: state,
       logger: pino({ level: "warn" }),
       printQRInTerminal: false,
-      browser: ["Rudo-Bot", "Chrome", "1.0.0"],
       markOnlineOnConnect: false
     });
 
@@ -261,10 +265,14 @@ async function startBot() {
         const statusCode =
           lastDisconnect?.error?.output?.statusCode;
 
-        console.error("Conexión cerrada. Código:", statusCode ?? "desconocido");
+        console.error(
+          "Conexión cerrada. Código:",
+          statusCode ?? "desconocido"
+        );
 
         if (statusCode === DisconnectReason.loggedOut) {
-          connectionStatus = "Sesión cerrada; requiere nueva vinculación.";
+          connectionStatus =
+            "Sesión cerrada; requiere nueva vinculación.";
           pairCode = null;
           console.error(connectionStatus);
           return;
@@ -313,7 +321,8 @@ async function startBot() {
             break;
 
           case "/estado":
-            response = "🤖 Rudo-Bot está conectado y funcionando.";
+            response =
+              "🤖 Rudo-Bot está conectado y funcionando.";
             break;
 
           default:
@@ -330,11 +339,13 @@ async function startBot() {
   } catch (error) {
     connectionStatus = "Error al iniciar";
     console.error("Error iniciando Rudo-Bot:", error);
+
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(() => {
       starting = false;
       startBot();
     }, 10000);
+
     return;
   }
 
@@ -345,4 +356,4 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Rudo-Bot escuchando en el puerto ${PORT}`);
   startBot();
 });
-            
+    
