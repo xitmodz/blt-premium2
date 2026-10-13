@@ -1,154 +1,234 @@
-const express = require("express");
-const crypto = require("crypto");
+
+import express from "express";
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} from "@whiskeysockets/baileys";
+import pino from "pino";
+import QRCode from "qrcode";
+import fs from "node:fs/promises";
 
 const app = express();
+app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const APP_SECRET = process.env.APP_SECRET;
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION;
+const ADMIN_USER = process.env.ADMIN_USER;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const AUTH_DIR = process.env.AUTH_DIR || "./auth";
+const QR_DIR = "/tmp/rudo-bot";
+const PREFIX = "/";
 
-if (
-  !VERIFY_TOKEN ||
-  !APP_SECRET ||
-  !WHATSAPP_TOKEN ||
-  !PHONE_NUMBER_ID ||
-  !GRAPH_API_VERSION
-) {
-  console.error("Faltan variables de entorno.");
+let sock;
+let qrDataUrl = null;
+let connectionStatus = "Iniciando";
+let starting = false;
+let reconnectTimer;
+
+if (!ADMIN_USER || !ADMIN_PASSWORD) {
+  console.error("Faltan ADMIN_USER y ADMIN_PASSWORD.");
   process.exit(1);
 }
 
-app.get("/", (req, res) => {
-  res.status(200).send("BLT Premium está funcionando.");
-});
+app.use(express.urlencoded({ extended: false }));
 
-// Verificación inicial del webhook de Meta.
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
+function authorized(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
+  if (scheme === "Basic" && encoded) {
+    let credentials = "";
+
+    try {
+      credentials = Buffer.from(encoded, "base64").toString();
+    } catch {}
+
+    const index = credentials.indexOf(":");
+    const user = credentials.slice(0, index);
+    const password = credentials.slice(index + 1);
+
+    if (
+      index > 0 &&
+      user === ADMIN_USER &&
+      password === ADMIN_PASSWORD
+    ) {
+      return next();
+    }
   }
 
-  return res.sendStatus(403);
-});
-
-async function enviarMensaje(destino, texto) {
-  const url =
-    `https://graph.facebook.com/` +
-    `${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`;
-
-  const respuesta = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to: destino,
-      type: "text",
-      text: { body: texto }
-    })
-  });
-
-  if (!respuesta.ok) {
-    const error = await respuesta.text();
-    console.error("Error enviando mensaje:", error);
-  }
+  res.set("WWW-Authenticate", 'Basic realm="Rudo-Bot"');
+  return res.status(401).send("Inicia sesión para acceder al panel.");
 }
 
-// Recibe el cuerpo original para verificar la firma de Meta.
-app.post(
-  "/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const firma = req.get("x-hub-signature-256") || "";
+app.get("/", (req, res) => {
+  res.type("text").send("Rudo-Bot está activo.");
+});
 
-    const firmaEsperada =
-      "sha256=" +
-      crypto
-        .createHmac("sha256", APP_SECRET)
-        .update(req.body)
-        .digest("hex");
+app.get("/panel", authorized, (req, res) => {
+  const qrSection = qrDataUrl
+    ? `<h2>Escanea este QR con tu WhatsApp</h2>
+       <img width="280" alt="QR privado de vinculación" src="${qrDataUrl}">`
+    : "<p>No hay QR disponible. Estado: " + connectionStatus + "</p>";
 
-    const firmaValida =
-      firma.length === firmaEsperada.length &&
-      crypto.timingSafeEqual(
-        Buffer.from(firma),
-        Buffer.from(firmaEsperada)
-      );
+  res.send(`
+    <!doctype html>
+    <html lang="es">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rudo-Bot</title>
+    <body style="font-family:Arial;max-width:600px;margin:40px auto;padding:16px">
+      <h1>🔥 Rudo-Bot Premium</h1>
+      <p>Estado: ${connectionStatus}</p>
+      ${qrSection}
+      <p>Abre WhatsApp en tu teléfono principal → Dispositivos vinculados
+      → Vincular un dispositivo y escanea el QR.</p>
+      <p>Por seguridad, no compartas este QR ni una captura del panel.</p>
+      <form method="post" action="/logout">
+        <button type="submit">Desconectar bot</button>
+      </form>
+    </body>
+    </html>
+  `);
+});
 
-    if (!firmaValida) {
-      return res.sendStatus(401);
-    }
+app.post("/logout", authorized, async (req, res) => {
+  try {
+    if (sock) await sock.logout();
+    connectionStatus = "Desconectado";
+    qrDataUrl = null;
+    res.send("Bot desconectado. Puedes cerrar esta página.");
+  } catch {
+    res.status(500).send("No se pudo desconectar.");
+  }
+});
 
-    let datos;
+async function startBot() {
+  if (starting) return;
+  starting = true;
 
+  try {
+    await fs.mkdir(AUTH_DIR, { recursive: true });
+    await fs.mkdir(QR_DIR, { recursive: true });
+
+    const { state, saveCreds } =
+      await useMultiFileAuthState(AUTH_DIR);
+
+    let version;
     try {
-      datos = JSON.parse(req.body.toString("utf8"));
+      const result = await fetchLatestBaileysVersion();
+      version = result.version;
     } catch {
-      return res.sendStatus(400);
+      version = undefined;
     }
 
-    // Confirmar recepción antes de procesar el evento.
-    res.sendStatus(200);
+    sock = makeWASocket({
+      ...(version ? { version } : {}),
+      auth: state,
+      logger: pino({ level: "silent" }),
+      printQRInTerminal: false,
+      browser: ["Rudo-Bot", "Chrome", "1.0.0"],
+      markOnlineOnConnect: false
+    });
 
-    try {
-      for (const entrada of datos.entry || []) {
-        for (const cambio of entrada.changes || []) {
-          if (cambio.field !== "messages") continue;
+    sock.ev.on("creds.update", saveCreds);
 
-          const valor = cambio.value || {};
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, qr, lastDisconnect } = update;
 
-          for (const mensaje of valor.messages || []) {
-            if (mensaje.type !== "text") continue;
+      if (qr) {
+        qrDataUrl = await QRCode.toDataURL(qr);
+        connectionStatus = "Esperando escaneo del QR";
+      }
 
-            const remitente = mensaje.from;
-            const texto = mensaje.text.body.trim();
-            const comando = texto.toLowerCase().split(/\s+/)[0];
+      if (connection === "open") {
+        qrDataUrl = null;
+        connectionStatus = "Conectado";
+        console.log("Rudo-Bot conectado.");
+      }
 
-            let respuesta;
+      if (connection === "close") {
+        qrDataUrl = null;
 
-            switch (comando) {
-              case "/menu":
-                respuesta =
-                  "🔥 BLT PREMIUM\n\n" +
-                  "/menu - Ver comandos\n" +
-                  "/ping - Probar el bot\n" +
-                  "/ayuda - Obtener ayuda";
-                break;
+        const statusCode =
+          lastDisconnect?.error?.output?.statusCode;
 
-              case "/ping":
-                respuesta = "🏓 ¡Pong! El BLT está activo.";
-                break;
+        if (statusCode === DisconnectReason.loggedOut) {
+          connectionStatus = "Sesión cerrada; elimina la sesión y vuelve a vincular.";
+          console.error(connectionStatus);
+          return;
+        }
 
-              case "/ayuda":
-                respuesta =
-                  "Escribe /menu para consultar los comandos.";
-                break;
+        connectionStatus = "Reconectando";
 
-              default:
-                // Ignorar los mensajes que no sean comandos.
-                continue;
-            }
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          starting = false;
+          startBot();
+        }, 5000);
+      }
+    });
 
-            await enviarMensaje(remitente, respuesta);
-          }
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+
+      for (const message of messages) {
+        if (!message.message || message.key.fromMe) continue;
+
+        const chat = message.key.remoteJid;
+        if (!chat) continue;
+
+        const text =
+          message.message.conversation ||
+          message.message.extendedTextMessage?.text ||
+          "";
+
+        if (!text.startsWith(PREFIX)) continue;
+
+        const [command] = text.trim().split(/\s+/);
+        let response;
+
+        switch (command.toLowerCase()) {
+          case "/menu":
+            response =
+              "🔥 RUDO-BOT PREMIUM\n\n" +
+              "/menu - Mostrar comandos\n" +
+              "/ping - Probar el bot\n" +
+              "/estado - Ver estado del bot";
+            break;
+
+          case "/ping":
+            response = "🏓 ¡Pong! Rudo-Bot está activo.";
+            break;
+
+          case "/estado":
+            response = "🤖 Rudo-Bot está conectado y funcionando.";
+            break;
+
+          default:
+            continue;
+        }
+
+        try {
+          await sock.sendMessage(chat, { text: response });
+        } catch (error) {
+          console.error("No se pudo responder:", error.message);
         }
       }
-    } catch (error) {
-      console.error("Error procesando webhook:", error);
-    }
+    });
+  } catch (error) {
+    connectionStatus = "Error al iniciar";
+    console.error("Error iniciando Rudo-Bot:", error);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      starting = false;
+      startBot();
+    }, 10000);
+    return;
   }
-);
+
+  starting = false;
+}
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`BLT Premium escuchando en el puerto ${PORT}`);
+  console.log(`Rudo-Bot escuchando en el puerto ${PORT}`);
+  startBot();
 });
